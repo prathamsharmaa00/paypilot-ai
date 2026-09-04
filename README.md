@@ -8,9 +8,9 @@ PayPilot AI is an agentic commerce prototype designed around a simple principle:
 
 **Don't search products. Delegate the decision.**
 
-A customer describes what they need in natural language. A local AI agent interprets the request and produces a structured shopping decision. A deterministic catalog verifies product and price constraints. A policy engine enforces financial boundaries. Before any payment action, the customer must explicitly authorize the purchase.
+A customer describes what they need in natural language. PayPilot uses a two-stage response strategy: deterministic intent parsing and catalog search render relevant products instantly, while a local AI agent runs concurrently to select tool parameters, extract constraints, and enrich the decision. A policy engine enforces financial boundaries, requiring explicit customer authorization before any payment action.
 
-Only after approval does the server create a Razorpay Test Mode order. After checkout, the payment is verified server-side using Razorpay signature and payment-status checks.
+Only after approval does the server create a Razorpay Test Mode order. After checkout, the payment is verified server-side using Razorpay signature, payment-to-order matching, and payment-status checks.
 
 The AI can recommend and reason.
 
@@ -49,25 +49,23 @@ PayPilot AI uses a controlled agentic workflow:
 
 ```text
 Customer Request
-      ↓
-Local AI Intent + Decision
-      ↓
-Deterministic Product Catalog
-      ↓
-Recommendation
-      ↓
-Contextual Upsell
-      ↓
-Policy Engine
-      ↓
-Human Authorization
-      ↓
-Server-side Razorpay Order
-      ↓
+       ↓
+Deterministic Intent + Catalog (Fast Path)
+       ↓
+Local AI Intent & Tool Selection (Enrichment)
+       ↓
+Recommendation & Contextual Upsell
+       ↓
+Policy Engine Evaluation
+       ↓
+Human Approval Gate
+       ↓
+Server-side Razorpay Order Creation
+       ↓
 Razorpay Test Checkout
-      ↓
+       ↓
 Server-side Payment Verification
-      ↓
+       ↓
 Agent Flight Recorder
 ```
 
@@ -75,30 +73,103 @@ Agent Flight Recorder
 
 ## 🤖 AI Architecture
 
-The project uses a local Qwen model through LM Studio.
+PayPilot AI uses a local Qwen model through LM Studio.
 
 ### Model
+
 `qwen/qwen3-4b-2507`
 
-The model is responsible for:
+The model is used as a constrained decision layer.
 
-- Understanding natural-language shopping requests
-- Extracting budget constraints
-- Identifying use cases
-- Producing structured shopping decisions
-- Explaining recommendations
-- Selecting the next agent action
+Qwen is responsible for:
 
-The model does not directly control:
+- Understanding the customer's natural-language request
+- Selecting relevant catalog search parameters
+- Identifying budget and use-case constraints
+- Selecting the controlled `search_catalog` tool
 
+The deterministic application layer remains responsible for:
+
+- Product data
 - Product prices
+- Catalog ranking
+- Financial limits
 - Cart totals
-- Policy limits
 - Payment amounts
-- Razorpay credentials
-- Payment execution
+- Final verified decision construction
+- Razorpay execution
 
-This separation intentionally limits the financial authority of the AI.
+The application intentionally does not ask the model to generate a second response after catalog execution. This avoids unnecessary inference latency and keeps the final commerce decision grounded in deterministic tool results.
+
+### AI safety boundary
+
+```text
+Customer Request
+       ↓
+Local Qwen
+       ↓
+Tool Parameters
+       ↓
+Deterministic Catalog
+       ↓
+Server-constructed Decision
+       ↓
+Policy Engine
+       ↓
+Human Approval
+       ↓
+Payment
+```
+
+The LLM never directly controls product prices, cart totals, payment amounts, Razorpay credentials or financial execution.
+
+### ⚡ Latency-aware execution
+
+PayPilot uses a two-stage response strategy.
+
+The deterministic path runs immediately so customers do not have to wait for the local model before seeing useful results.
+
+```text
+Customer Request
+       │
+       ├──────────────→ Deterministic Intent
+       │                         ↓
+       │                   Catalog Search
+       │                         ↓
+       │                  Immediate UI
+       │
+       └──────────────→ Local Qwen
+                                 ↓
+                          Tool Selection
+                                 ↓
+                         Decision Validation
+```
+
+This design prevents local model latency from blocking the primary shopping experience.
+
+The local model is used to enrich and validate the commerce decision rather than becoming a mandatory bottleneck for initial product rendering.
+
+---
+
+## 🔄 AI Failure Fallback
+
+PayPilot does not make the local LLM a single point of failure for product discovery.
+
+If the local Qwen model becomes unavailable:
+
+```text
+Customer Request
+       ↓
+Deterministic Intent Parser
+       ↓
+Deterministic Catalog
+       ↓
+Recommendations remain available
+       │
+       └── Local AI failure recorded in Flight Recorder
+```
+
+This allows the core commerce experience to remain usable while clearly surfacing that the AI enrichment layer is unavailable.
 
 ---
 
@@ -164,11 +235,13 @@ Razorpay orders are created server-side through:
 
 `POST /api/payment/create-order`
 
+The UI requires the application approval state to pass the server-side policy check before creating the Razorpay order.
+
 The server:
 
 - Rebuilds the cart from the trusted catalog
 - Re-evaluates the financial policy
-- Requires explicit customer approval
+- Validates the server authorization state
 - Converts INR to paise
 - Creates the Razorpay Test Mode order
 - Returns only safe client-side information
@@ -179,47 +252,53 @@ The Razorpay Key Secret remains server-side.
 
 After the customer has authorized the purchase, the application opens Razorpay Test Mode Checkout using the server-created `order_id`.
 
+### API boundaries
+
+| Endpoint | Responsibility |
+|---|---|
+| `POST /api/agent` | Runs constrained local AI tool selection |
+| `POST /api/payment/create-order` | Validates cart, policy and creates Razorpay order |
+| `POST /api/payment/verify` | Verifies payment signature, order relationship and capture status |
+
 ---
 
 ## ✅ Payment Verification
 
-Payment success is not trusted solely from the browser callback.
+Payment success is never trusted solely from the browser callback.
 
 The application sends the Razorpay payment response to:
 
 `POST /api/payment/verify`
 
-The server verifies:
+The server independently verifies:
 
-- Razorpay signature
-- Payment-to-order relationship
-- Payment capture status
+1. Razorpay payment signature
+2. Payment-to-order relationship
+3. Payment capture status
 
-Only after these checks succeed is the payment treated as verified.
+Only when all checks succeed does PayPilot mark the transaction as verified.
+
+The browser is therefore treated as an input source, not the source of truth for payment confirmation.
 
 ---
 
-## 🛡️ Failure Recovery
+## 🛡️ Failure Handling & Recovery Boundaries
 
-The system was deliberately tested against invalid execution attempts.
+The system was deliberately tested against invalid execution attempts and payment verification failures.
 
 ### Test 1 — Payment without approval
 
-Input:
-`customerApproved = false`
+Input: `customerApproved = false`
 
-Result:
-`HTTP 403 Forbidden`
+Result: `HTTP 403 Forbidden`
 
 No Razorpay order is created.
 
 ### Test 2 — Unknown product
 
-Input:
-`fake-product-999`
+Input: `fake-product-999`
 
-Result:
-`HTTP 400 Bad Request`
+Result: `HTTP 400 Bad Request`
 
 The server rejects the product because it is not present in the trusted catalog.
 
@@ -228,10 +307,13 @@ The server rejects the product because it is not present in the trusted catalog.
 A successful Razorpay Test Mode payment was verified server-side.
 
 Result:
+
 `Payment verified`
+
 `Execution completed`
 
-### Security principle
+### Failure-handling principle
+
 ```text
 Invalid request
       ↓
@@ -241,6 +323,8 @@ Reject
       ↓
 No financial execution
 ```
+
+PayPilot does not automatically retry financial actions after an uncertain payment state.
 
 ---
 
@@ -253,7 +337,9 @@ Example execution trace:
 ```text
 Session initialized
 User request received
-Local AI decision
+Fast catalog path (1 ms)
+Recommendations rendered (3 ms)
+Local AI decision (18343 ms)
 Constraints extracted
 Catalog tool executed
 Catalog results verified
@@ -270,7 +356,16 @@ Payment verified
 Execution completed
 ```
 
-The Flight Recorder makes the agent's decisions and financial boundaries observable.
+The Flight Recorder also captures execution timing for important operations, making model latency and deterministic tool latency observable.
+
+Example:
+
+```text
+Local AI decision        18343 ms
+Catalog search               1 ms
+```
+
+This makes the performance difference between probabilistic AI inference and deterministic business logic visible during evaluation.
 
 ---
 
@@ -278,44 +373,62 @@ The Flight Recorder makes the agent's decisions and financial boundaries observa
 
 ### Customer request
 
-> "I need a laptop under ₹60000 for coding and gaming."
+> "I need a laptop under ₹60,000 for coding and gaming."
 
 ### Agent decision
 
-The agent identifies:
+The system identifies:
 
 - **Budget**: ₹60,000
 - **Use cases**: coding, gaming
-- **Recommendation**: Nova X16 (₹57,990)
-- **Policy**: Single item limit ₹60,000; Cart limit ₹65,000; Customer approval Required
-- **Payment**: Razorpay Test Mode (₹57,990)
-- **Verification**: Signature Verified; Order Matched; Payment status Captured
+- **Top recommendation**: Nova X16 — ₹57,990
+- **Catalog**: Deterministic and server-owned
+- **Policy**: ₹60,000 single-item limit; ₹65,000 cart limit
+- **Customer approval**: Required
+- **Payment**: Razorpay Test Mode
+- **Verification**: Signature verified; payment matched to order; payment captured
 - **Result**: `VERIFIED`
 
 ---
 
 ## 🏗️ Architecture
 
-High-level architecture:
+### High-level architecture
 
 ```text
-Customer
-   ↓
-PayPilot AI / Local Qwen
-   ↓
-Deterministic Catalog
-   ↓
-Policy Engine
-   ↓
-Human Approval Gate
-   ↓
-Server-side Payment API
-   ↓
-Razorpay Test Mode
-   ↓
-Payment Verification
-   ↓
-Flight Recorder
+                         CUSTOMER
+                            │
+                            ▼
+                    PayPilot Workbench
+                            │
+                ┌───────────┴───────────┐
+                │                       │
+                ▼                       ▼
+      Deterministic Fast Path       Local Qwen
+                │                       │
+        Intent + Catalog          Tool Selection
+                │                       │
+                └───────────┬───────────┘
+                            ▼
+                  Verified Recommendations
+                            │
+                            ▼
+                     Policy Engine
+                            │
+                            ▼
+                  Human Approval Gate
+                            │
+                            ▼
+                Server-side Order Creation
+                            │
+                            ▼
+                   Razorpay Test Mode
+                            │
+                            ▼
+               Server-side Verification
+                            │
+                            ▼
+                  Agent Flight Recorder
 ```
 
 ### Financial boundary
@@ -382,10 +495,7 @@ paypilot-ai/
 │   ├── intent.ts
 │   └── policy.ts
 │
-├── docs/
-│   └── architecture-diagram.png
-│
-├── .env.local
+├── .env.example
 ├── .gitignore
 ├── package.json
 └── README.md
@@ -402,11 +512,11 @@ npm install
 
 ### 2. Configure environment variables
 
-Create `.env.local` and add:
+Copy `.env.example` to `.env.local` and add your credentials:
 
 ```env
 RAZORPAY_KEY_ID=rzp_test_xxxxxxxxx
-RAZORPAY_KEY_SECRET
+RAZORPAY_KEY_SECRET=your_test_secret_here
 ```
 
 *Never commit `.env.local`.*
@@ -454,13 +564,32 @@ Both currently pass successfully.
 
 ## 🔑 Security Decisions
 
-1. **No autonomous financial execution**: The AI cannot directly execute payments.
-2. **Human authorization**: A customer must explicitly approve the payment.
-3. **Server-side price validation**: The server reconstructs product prices from the trusted catalog.
-4. **Server-side policy enforcement**: Financial limits are re-evaluated before creating a Razorpay order.
-5. **Secret isolation**: `RAZORPAY_KEY_SECRET` is never exposed to client-side code.
-6. **Server-side payment verification**: Payment success is verified independently of the browser callback.
-7. **No autonomous retries**: PayPilot does not automatically retry financial actions.
+1. **No autonomous financial execution**  
+   The AI cannot directly execute payments.
+
+2. **Explicit customer approval**  
+   The customer must explicitly approve the cart before entering the payment flow.
+
+3. **Server-side price validation**  
+   Product prices are reconstructed from the trusted server-side catalog.
+
+4. **Server-side policy enforcement**  
+   Financial limits are independently re-evaluated before a Razorpay order is created.
+
+5. **Secret isolation**  
+   `RAZORPAY_KEY_SECRET` is never exposed to client-side code.
+
+6. **Server-side payment verification**  
+   Payment success is independently verified using the Razorpay signature, order relationship and captured payment status.
+
+7. **No autonomous retries**  
+   PayPilot does not automatically retry financial actions.
+
+8. **Deterministic financial boundary**  
+   The LLM does not determine the final payment amount. The server derives the amount from trusted catalog data and policy rules.
+
+9. **AI fallback behavior**  
+   If the local AI is unavailable, deterministic catalog recommendations remain available rather than blocking the entire shopping experience.
 
 ---
 
@@ -474,6 +603,6 @@ The demonstration covers:
 - Policy evaluation
 - Human authorization
 - Razorpay Test Mode checkout
+- Invalid payment execution handling
 - Server-side payment verification
-- Flight Recorder
-- Failure recovery
+- Flight Recorder execution trace

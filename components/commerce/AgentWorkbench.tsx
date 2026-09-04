@@ -414,6 +414,9 @@ export default function AgentWorkbench() {
     }
 
     setCart(nextCart);
+    setOrderApproved(false);
+    setApprovalToken(null);
+    setPaymentStatus("IDLE");
 
     addAuditEvent(
       "Policy engine evaluated",
@@ -436,18 +439,50 @@ export default function AgentWorkbench() {
 
     if (cart.some((item) => item.id === upsell.id)) return;
 
-    setCart((current) => [
-      ...current,
+    const nextCart: CartItem[] = [
+      ...cart,
       {
         id: upsell.id,
         name: upsell.name,
         price: upsell.price,
       },
-    ]);
+    ];
+
+    const policy = evaluateCartPolicy({
+      cart: nextCart,
+      customerApproved: false,
+    });
+
+    setPolicyDecision(policy);
+
+    if (!policy.allowed) {
+      addAuditEvent(
+        "Policy blocked upsell addition",
+        policy.reason,
+        "warning",
+        "POLICY"
+      );
+
+      return;
+    }
+
+    setCart(nextCart);
+    setOrderApproved(false);
+    setApprovalToken(null);
+    setPaymentStatus("IDLE");
+
+    addAuditEvent(
+      "Policy engine evaluated",
+      `Cart value ${formatCurrency(
+        policy.maxAuthorizedAmount
+      )}. Customer approval required.`,
+      "success",
+      "POLICY"
+    );
 
     addAuditEvent(
       "Upsell accepted",
-      `${upsell.name} added. Agent did not auto-add the product.`,
+      `${upsell.name} added after explicit customer action. Policy evaluated.`,
       "success"
     );
   }
@@ -455,14 +490,22 @@ export default function AgentWorkbench() {
   function removeItem(id: string) {
     const item = cart.find((cartItem) => cartItem.id === id);
 
-    setCart((current) =>
-      current.filter((cartItem) => cartItem.id !== id)
-    );
+    const nextCart = cart.filter((cartItem) => cartItem.id !== id);
+    setCart(nextCart);
+    setOrderApproved(false);
+    setApprovalToken(null);
+    setPaymentStatus("IDLE");
+
+    const policy = evaluateCartPolicy({
+      cart: nextCart,
+      customerApproved: false,
+    });
+    setPolicyDecision(policy);
 
     if (item) {
       addAuditEvent(
         "Cart item removed",
-        `${item.name} removed by customer.`,
+        `${item.name} removed by customer. Explicit re-approval required.`,
         "info"
       );
     }
